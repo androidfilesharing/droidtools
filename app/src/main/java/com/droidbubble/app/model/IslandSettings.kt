@@ -1,5 +1,10 @@
 package com.droidbubble.app.model
 
+import com.droidbubble.app.fold.BubblePlacement
+import com.droidbubble.app.fold.DisplayRole
+import com.droidbubble.app.weather.WeatherLocationMode
+import com.droidbubble.app.weather.WeatherUnits
+
 val DEFAULT_FEATURE_PRIORITIES = listOf(
     "CALL",
     "MEDIA",
@@ -97,7 +102,17 @@ data class IslandSettings(
     val droidbarBackgroundOpacity: Float = 1.0f,
     val droidbarMaxHeightDp: Int = 600,
     val droidbarYOffsetDp: Int = 0,
-    val droidbarHapticsEnabled: Boolean = true
+    val droidbarHapticsEnabled: Boolean = true,
+    val coverPlacement: BubblePlacement = BubblePlacement(),
+    val innerPlacement: BubblePlacement = BubblePlacement(),
+    val placementProfilesInitialized: Boolean = false,
+    val placementRolesSeen: Set<DisplayRole> = emptySet(),
+    val seenFoldingFeature: Boolean = false,
+    val lastActiveRole: DisplayRole = DisplayRole.SINGLE,
+    val weatherLocationMode: WeatherLocationMode = WeatherLocationMode.MANUAL,
+    val weatherUnits: WeatherUnits = WeatherUnits.SYSTEM,
+    val weatherLocationDenied: Boolean = false,
+    val cachedWeather: String = ""
 ) {
     val isGlass: Boolean get() = designLanguage == DesignLanguage.GLASS || glassEnabled
     val isMaterial3: Boolean get() = designLanguage == DesignLanguage.MATERIAL3

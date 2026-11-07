@@ -14,21 +14,21 @@ data class HourlyWeather(
 )
 
 data class WeatherInfo(
-    val temperatureC: Int = 22,
-    val condition: String = "Partly Cloudy",
-    val highC: Int = 25,
-    val lowC: Int = 16,
-    val humidityPct: Int = 54,
-    val windKmh: Int = 14,
-    val uvIndex: Int = 3,
-    val cityName: String = "Local Weather",
-    val hourlyForecast: List<HourlyWeather> = listOf(
-        HourlyWeather("Now", 22, "Partly Cloudy"),
-        HourlyWeather("+1h", 23, "Sunny"),
-        HourlyWeather("+2h", 24, "Sunny"),
-        HourlyWeather("+3h", 23, "Partly Cloudy"),
-        HourlyWeather("+4h", 20, "Clear")
-    )
+    val temperatureC: Int = 0,
+    val condition: String = "",
+    val highC: Int = 0,
+    val lowC: Int = 0,
+    val humidityPct: Int = 0,
+    val windKmh: Int = 0,
+    val uvIndex: Int = 0,
+    val cityName: String = "",
+    val hourlyForecast: List<HourlyWeather> = emptyList(),
+    val hasReading: Boolean = false,
+    val temperatureLabel: String = "—",
+    val statusName: String = "UNAVAILABLE",
+    val sourceName: String = "",
+    val detail: String = "",
+    val fetchedAtEpochMs: Long = 0L
 )
 
 data class NetworkSpeedInfo(
