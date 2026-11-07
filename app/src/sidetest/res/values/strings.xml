@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">DroidTools Test</string>
+    <string name="side_by_side_warning">Test build. Grant overlay and accessibility for DroidTools Test separately. Do not run this bubble and the original Droidtools bubble at the same time.</string>
+</resources>

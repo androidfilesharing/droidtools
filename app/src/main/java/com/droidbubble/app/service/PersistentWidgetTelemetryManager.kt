@@ -11,10 +11,30 @@ import android.view.Choreographer
 import android.view.WindowManager
 import com.droidbubble.app.island.IslandStateManager
 import com.droidbubble.app.model.FpsInfo
-import com.droidbubble.app.model.HourlyWeather
 import com.droidbubble.app.model.IslandSettings
 import com.droidbubble.app.model.NetworkSpeedInfo
-import com.droidbubble.app.model.WeatherInfo
+import com.droidbubble.app.weather.CoarseLocationClient
+import com.droidbubble.app.weather.GeoFix
+import com.droidbubble.app.weather.LOCATION_FIX_MAX_AGE_MS
+import com.droidbubble.app.weather.LocationRequest
+import com.droidbubble.app.weather.WEATHER_REFRESH_INTERVAL_MS
+import com.droidbubble.app.weather.WeatherLocationMode
+import com.droidbubble.app.weather.WeatherSnapshot
+import com.droidbubble.app.weather.WeatherSource
+import com.droidbubble.app.weather.WeatherStatus
+import com.droidbubble.app.weather.ageStatus
+import com.droidbubble.app.weather.decodeSnapshot
+import com.droidbubble.app.weather.encodeSnapshot
+import com.droidbubble.app.weather.foldOffline
+import com.droidbubble.app.weather.foldUnavailable
+import com.droidbubble.app.weather.forecastUrl
+import com.droidbubble.app.weather.geocodeUrl
+import com.droidbubble.app.weather.locationRequestFor
+import com.droidbubble.app.weather.parseForecast
+import com.droidbubble.app.weather.parseGeocode
+import com.droidbubble.app.weather.resolveTempUnit
+import com.droidbubble.app.weather.toWeatherInfo
+import com.droidbubble.app.weather.zonePlace
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,9 +44,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.Locale
@@ -39,6 +56,12 @@ class PersistentWidgetTelemetryManager(private val context: Context) {
     private var networkJob: Job? = null
     private var weatherJob: Job? = null
     private var customCity: String = ""
+    private var latestSettings = IslandSettings()
+    private var memoryFix: GeoFix? = null
+    private var lastReportedCoarseGranted: Boolean? = null
+    private val locationClient = CoarseLocationClient(context)
+    var onCacheWeather: ((String) -> Unit)? = null
+    var onCoarseLocationGranted: ((Boolean) -> Unit)? = null
     private var isFpsRunning = false
 
     private var prevRxBytes = -1L
@@ -129,6 +152,15 @@ class PersistentWidgetTelemetryManager(private val context: Context) {
     }
 
     fun updateSettings(settings: IslandSettings) {
+        latestSettings = settings
+        if (settings.weatherLocationMode != WeatherLocationMode.CURRENT) {
+            memoryFix = null
+        }
+        decodeSnapshot(settings.cachedWeather)?.let { cached ->
+            val aged = ageStatus(cached, System.currentTimeMillis())
+            val unit = resolveTempUnit(settings.weatherUnits, Locale.getDefault().country)
+            IslandStateManager.updateWeather(aged.toWeatherInfo(unit))
+        }
         if (settings.showFps) {
             if (!isFpsRunning) {
                 resolveDisplayHz()
@@ -274,170 +306,147 @@ class PersistentWidgetTelemetryManager(private val context: Context) {
         weatherJob = scope.launch(Dispatchers.IO) {
             while (isActive) {
                 fetchWeather()
-                // Refresh weather every 20 minutes
-                delay(20 * 60 * 1000L)
+                delay(WEATHER_REFRESH_INTERVAL_MS)
             }
         }
     }
 
-    private suspend fun resolveCityCoordinates(cityName: String): Triple<Double, Double, String> {
-        return try {
-            val encoded = java.net.URLEncoder.encode(cityName.trim(), "UTF-8")
-            val url = URL("https://geocoding-api.open-meteo.com/v1/search?name=$encoded&count=1&language=en&format=json")
-            val conn = url.openConnection() as HttpURLConnection
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.requestMethod = "GET"
-            if (conn.responseCode == 200) {
-                val text = conn.inputStream.bufferedReader().use { it.readText() }
-                val json = JSONObject(text)
-                val results = json.optJSONArray("results")
-                if (results != null && results.length() > 0) {
-                    val first = results.getJSONObject(0)
-                    val lat = first.getDouble("latitude")
-                    val lon = first.getDouble("longitude")
-                    val name = first.getString("name")
-                    val country = first.optString("country_code", "")
-                    val displayName = if (country.isNotBlank()) "$name, ${country.uppercase(Locale.ROOT)}" else name
-                    Triple(lat, lon, displayName)
-                } else {
-                    val tz = TimeZone.getDefault().id
-                    approximateCoordsForTimeZone(tz)
-                }
-            } else {
-                val tz = TimeZone.getDefault().id
-                approximateCoordsForTimeZone(tz)
-            }
-        } catch (_: Exception) {
-            val tz = TimeZone.getDefault().id
-            approximateCoordsForTimeZone(tz)
-        }
+    private fun previousSnapshot(): WeatherSnapshot? {
+        return decodeSnapshot(latestSettings.cachedWeather)
     }
 
     private suspend fun fetchWeather() {
-        try {
-            val (lat, lon, defaultCity) = if (customCity.isNotBlank()) {
-                resolveCityCoordinates(customCity)
-            } else {
-                val tz = TimeZone.getDefault().id
-                approximateCoordsForTimeZone(tz)
-            }
-
-            val urlString = "https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon&current=temperature_2m,relative_humidity_2m,weather_code,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min&timezone=auto"
-            val url = URL(urlString)
-            val connection = url.openConnection() as HttpURLConnection
-            connection.connectTimeout = 6000
-            connection.readTimeout = 6000
-            connection.requestMethod = "GET"
-
-            if (connection.responseCode == 200) {
-                val reader = BufferedReader(InputStreamReader(connection.inputStream))
-                val response = reader.readText()
-                reader.close()
-
-                val json = JSONObject(response)
-                val current = json.getJSONObject("current")
-                val tempC = current.getDouble("temperature_2m").roundToInt()
-                val humidity = current.optInt("relative_humidity_2m", 54)
-                val windKmh = current.optDouble("wind_speed_10m", 12.0).roundToInt()
-                val weatherCode = current.optInt("weather_code", 1)
-
-                val daily = json.optJSONObject("daily")
-                val highC = daily?.optJSONArray("temperature_2m_max")?.optDouble(0, (tempC + 4).toDouble())?.roundToInt() ?: (tempC + 4)
-                val lowC = daily?.optJSONArray("temperature_2m_min")?.optDouble(0, (tempC - 4).toDouble())?.roundToInt() ?: (tempC - 4)
-
-                val condition = mapWeatherCodeToCondition(weatherCode)
-
-                val hourly = listOf(
-                    HourlyWeather("Now", tempC, condition),
-                    HourlyWeather("+1h", tempC + 1, condition),
-                    HourlyWeather("+2h", highC, condition),
-                    HourlyWeather("+3h", tempC, condition),
-                    HourlyWeather("+4h", lowC + 2, "Clear")
-                )
-
-                val weatherInfo = WeatherInfo(
-                    temperatureC = tempC,
-                    condition = condition,
-                    highC = highC,
-                    lowC = lowC,
-                    humidityPct = humidity,
-                    windKmh = windKmh,
-                    uvIndex = 3,
-                    cityName = defaultCity,
-                    hourlyForecast = hourly
-                )
-
-                withContext(Dispatchers.Main) {
-                    IslandStateManager.updateWeather(weatherInfo)
+        val settings = latestSettings
+        val now = System.currentTimeMillis()
+        val permissionGranted = androidx.core.content.ContextCompat.checkSelfPermission(
+            context,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+        if (settings.weatherLocationMode != WeatherLocationMode.CURRENT || !permissionGranted) {
+            memoryFix = null
+        }
+        if (lastReportedCoarseGranted != permissionGranted) {
+            lastReportedCoarseGranted = permissionGranted
+            withContext(Dispatchers.Main) { onCoarseLocationGranted?.invoke(permissionGranted) }
+        }
+        val request = locationRequestFor(settings.weatherLocationMode, permissionGranted, memoryFix?.let { now - it.timeMs })
+        when (request) {
+            LocationRequest.USE_CACHED -> {
+                val fix = memoryFix
+                if (fix == null) {
+                    publish(foldUnavailable(previousSnapshot(), "Location unavailable"), denied = false)
+                } else {
+                    publishForecast(fix.latitude, fix.longitude, "Current location", WeatherSource.CURRENT_LOCATION, now)
                 }
-            } else {
-                useFallbackWeather()
             }
-        } catch (_: Exception) {
-            useFallbackWeather()
+            LocationRequest.FETCH_FRESH -> {
+                val cached = locationClient.newestFix(now)
+                if (cached != null && cached.first in 0 until LOCATION_FIX_MAX_AGE_MS) {
+                    memoryFix = cached.second
+                    publishForecast(cached.second.latitude, cached.second.longitude, "Current location", WeatherSource.CURRENT_LOCATION, now)
+                } else {
+                    val fix = locationClient.singleFix()
+                    if (fix == null) {
+                        memoryFix = null
+                        if (settings.weatherCity.isNotBlank()) {
+                            fetchManualCity(settings.weatherCity, now, forceStatus = WeatherStatus.UNAVAILABLE)
+                        } else {
+                            publish(foldUnavailable(previousSnapshot(), "Location unavailable"), denied = false)
+                        }
+                    } else {
+                        memoryFix = fix
+                        publishForecast(fix.latitude, fix.longitude, "Current location", WeatherSource.CURRENT_LOCATION, now)
+                    }
+                }
+            }
+            LocationRequest.NONE -> {
+                if (settings.weatherLocationMode == WeatherLocationMode.CURRENT && !permissionGranted) {
+                    if (settings.weatherCity.isNotBlank()) {
+                        fetchManualCity(settings.weatherCity, now, forceStatus = WeatherStatus.DENIED)
+                    } else {
+                        val denied = foldUnavailable(previousSnapshot(), "Location off").copy(status = WeatherStatus.DENIED)
+                        publish(denied, denied = true)
+                    }
+                } else if (settings.weatherCity.isNotBlank()) {
+                    fetchManualCity(settings.weatherCity, now, forceStatus = null)
+                } else {
+                    val zone = zonePlace(TimeZone.getDefault().id)
+                    if (zone == null) {
+                        publish(foldUnavailable(previousSnapshot(), "Time zone unavailable"), denied = false)
+                    } else {
+                        publishForecast(zone.latitude, zone.longitude, zone.name, WeatherSource.TIMEZONE_ESTIMATE, now)
+                    }
+                }
+            }
         }
     }
 
-    private suspend fun useFallbackWeather() {
-        val (_, _, defaultCity) = if (customCity.isNotBlank()) {
-            Triple(0.0, 0.0, customCity)
-        } else {
-            val tz = TimeZone.getDefault().id
-            approximateCoordsForTimeZone(tz)
+    private suspend fun fetchManualCity(city: String, now: Long, forceStatus: WeatherStatus?) {
+        val body = httpGet(geocodeUrl(city))
+        val hit = body?.let { parseGeocode(it) }
+        if (hit == null) {
+            publish(foldUnavailable(previousSnapshot(), "City not found"), denied = false)
+            return
         }
+        publishForecast(hit.latitude, hit.longitude, hit.placeLabel, WeatherSource.MANUAL_CITY, now, forceStatus)
+    }
+
+    private suspend fun publishForecast(
+        latitude: Double,
+        longitude: Double,
+        place: String,
+        source: WeatherSource,
+        now: Long,
+        forceStatus: WeatherStatus? = null
+    ) {
+        val body = httpGet(forecastUrl(latitude, longitude))
+        if (body == null) {
+            publish(foldOffline(previousSnapshot()) ?: foldUnavailable(null, "Offline"), denied = false)
+            return
+        }
+        val parsed = parseForecast(body, place, source, now)
+        publish(if (forceStatus != null) parsed.copy(status = forceStatus) else parsed, denied = forceStatus == WeatherStatus.DENIED)
+    }
+
+    private suspend fun publish(snapshot: WeatherSnapshot?, denied: Boolean) {
+        val resolved = when {
+            snapshot == null -> foldUnavailable(null, "Offline")
+            denied && snapshot.status != WeatherStatus.DENIED -> snapshot.copy(status = WeatherStatus.DENIED)
+            else -> snapshot
+        }
+        val aged = ageStatus(resolved, System.currentTimeMillis())
+        val unit = resolveTempUnit(latestSettings.weatherUnits, Locale.getDefault().country)
+        val info = aged.toWeatherInfo(unit)
         withContext(Dispatchers.Main) {
-            IslandStateManager.updateWeather(
-                WeatherInfo(
-                    temperatureC = 22,
-                    condition = "Partly Cloudy",
-                    highC = 25,
-                    lowC = 16,
-                    humidityPct = 52,
-                    windKmh = 14,
-                    uvIndex = 3,
-                    cityName = defaultCity
-                )
-            )
+            IslandStateManager.updateWeather(info)
+        }
+        if (!aged.hasReading && aged.detail.isBlank()) return
+        val encoded = encodeSnapshot(aged)
+        if (encoded != latestSettings.cachedWeather) {
+            latestSettings = latestSettings.copy(cachedWeather = encoded)
+            withContext(Dispatchers.Main) {
+                onCacheWeather?.invoke(encoded)
+            }
         }
     }
 
-    private fun mapWeatherCodeToCondition(code: Int): String {
-        return when (code) {
-            0 -> "Clear"
-            1 -> "Mainly Clear"
-            2 -> "Partly Cloudy"
-            3 -> "Overcast"
-            45, 48 -> "Foggy"
-            51, 53, 55 -> "Drizzle"
-            61, 63, 65 -> "Rainy"
-            71, 73, 75 -> "Snowy"
-            80, 81, 82 -> "Showers"
-            95, 96, 99 -> "Thunderstorm"
-            else -> "Partly Cloudy"
-        }
-    }
-
-    private fun approximateCoordsForTimeZone(tzId: String): Triple<Double, Double, String> {
-        val lower = tzId.lowercase(Locale.ROOT)
-        return when {
-            lower.contains("athens") || lower.contains("greece") -> Triple(37.98, 23.72, "Athens")
-            lower.contains("london") -> Triple(51.50, -0.12, "London")
-            lower.contains("paris") -> Triple(48.85, 2.35, "Paris")
-            lower.contains("berlin") -> Triple(52.52, 13.40, "Berlin")
-            lower.contains("new_york") -> Triple(40.71, -74.00, "New York")
-            lower.contains("los_angeles") -> Triple(34.05, -118.24, "Los Angeles")
-            lower.contains("chicago") -> Triple(41.87, -87.62, "Chicago")
-            lower.contains("tokyo") -> Triple(35.67, 139.65, "Tokyo")
-            lower.contains("sydney") -> Triple(-33.86, 151.20, "Sydney")
-            lower.contains("rome") -> Triple(41.90, 12.49, "Rome")
-            lower.contains("madrid") -> Triple(40.41, -3.70, "Madrid")
-            lower.contains("toronto") -> Triple(43.65, -79.38, "Toronto")
-            lower.contains("europe") -> Triple(48.85, 2.35, "Central Europe")
-            lower.contains("america") -> Triple(40.71, -74.00, "Eastern Time")
-            lower.contains("asia") -> Triple(35.67, 139.65, "Tokyo")
-            else -> Triple(37.98, 23.72, "Local Weather")
-        }
+    private fun httpGet(url: String): String? {
+        return runCatching {
+            val connection = (URL(url).openConnection() as HttpURLConnection).apply {
+                connectTimeout = 6000
+                readTimeout = 6000
+                requestMethod = "GET"
+            }
+            try {
+                if (connection.responseCode != 200) {
+                    null
+                } else {
+                    connection.inputStream.bufferedReader().use { it.readText() }
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }.getOrNull()
     }
 
     private fun startAlarmMonitoring() {

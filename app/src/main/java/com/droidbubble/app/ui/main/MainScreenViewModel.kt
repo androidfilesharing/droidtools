@@ -7,7 +7,9 @@ import android.content.pm.PackageManager
 import android.graphics.drawable.Drawable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.droidbubble.app.BuildConfig
 import com.droidbubble.app.data.SettingsRepository
+import com.droidbubble.app.util.UpdatePolicy
 import com.droidbubble.app.model.IslandSettings
 import com.droidbubble.app.service.IslandOverlayService
 import kotlinx.coroutines.Dispatchers
@@ -70,6 +72,10 @@ class MainScreenViewModel(private val repository: SettingsRepository) : ViewMode
     }
 
     fun checkForUpdates(context: Context) {
+        if (!UpdatePolicy.shouldCheckUpstream(BuildConfig.UPSTREAM_UPDATE_CHECKS)) {
+            _updateState.value = UpdateState.UpToDate
+            return
+        }
         viewModelScope.launch {
             _updateState.value = UpdateState.Checking
             when (val result = com.droidbubble.app.util.UpdateManager.checkGithubUpdates(context)) {

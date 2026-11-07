@@ -3414,7 +3414,7 @@ fun AuxiliaryBubbleContent(
         IslandPriority.WEATHER -> {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    text = "${weatherInfo.temperatureC}°",
+                    text = weatherInfo.temperatureLabel,
                     color = if (isM3) m3Primary else Color(0xFFFF9F0A),
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold
@@ -3747,7 +3747,7 @@ fun CompactContent(
 
             IslandPriority.WEATHER -> {
                 Text(
-                    text = "${weatherInfo.temperatureC}°",
+                    text = weatherInfo.temperatureLabel,
                     color = if (isM3) m3OnSurface else Color.White,
                     fontSize = 11.5.sp,
                     fontWeight = FontWeight.Bold,
@@ -6302,7 +6302,7 @@ fun ExpandedWeatherView(
                 verticalArrangement = Arrangement.Center
             ) {
                 Text(
-                    text = "${weatherInfo.temperatureC}°C",
+                    text = weatherInfo.temperatureLabel,
                     color = weatherTextColor,
                     fontSize = tempSize,
                     fontWeight = FontWeight.Bold,
@@ -6311,7 +6311,11 @@ fun ExpandedWeatherView(
                 )
 
                 Text(
-                    text = "${weatherInfo.cityName.ifBlank { "Local Weather" }} • ${weatherInfo.condition.ifBlank { "Clear" }}",
+                    text = if (!weatherInfo.hasReading) {
+                        weatherInfo.detail.ifBlank { "Weather unavailable" }
+                    } else {
+                        "${weatherInfo.cityName} • ${weatherInfo.condition}"
+                    },
                     color = weatherSubColor,
                     fontSize = subtitleSize,
                     fontWeight = FontWeight.Medium,

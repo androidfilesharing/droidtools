@@ -1,6 +1,7 @@
 package com.droidbubble.app.util
 
 import android.content.Context
+import com.droidbubble.app.BuildConfig
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -32,8 +33,8 @@ sealed interface UpdateCheckResult {
 
 object UpdateManager {
 
-    private const val GITHUB_RELEASES_API = "https://api.github.com/repos/Velocity081/droidtools/releases"
-    private const val GITHUB_RELEASES_ATOM = "https://github.com/Velocity081/droidtools/releases.atom"
+    private val GITHUB_RELEASES_API = UpstreamEndpoints.RELEASES_API
+    private val GITHUB_RELEASES_ATOM = UpstreamEndpoints.RELEASES_ATOM
     private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Droidtools) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     fun getCurrentVersion(context: Context): String {
@@ -46,6 +47,9 @@ object UpdateManager {
     }
 
     suspend fun checkGithubUpdates(context: Context): UpdateCheckResult = withContext(Dispatchers.IO) {
+        if (!UpdatePolicy.shouldCheckUpstream(BuildConfig.UPSTREAM_UPDATE_CHECKS)) {
+            return@withContext UpdateCheckResult.UpToDate
+        }
         // Try the GitHub REST API first
         val apiResult = runCatching { fetchFromApi(context) }.getOrNull()
         if (apiResult != null && apiResult !is UpdateCheckResult.Error) {
@@ -107,7 +111,7 @@ object UpdateManager {
             }
 
             val finalUrl = apkUrl
-                ?: "https://github.com/Velocity081/droidtools/releases/download/$tagName/Droidtools.apk"
+                ?: UpstreamEndpoints.downloadUrl(tagName)
 
             val cleanVersion = tagName.removePrefix("v").removePrefix("V").trim()
             targetRelease = AppReleaseInfo(
@@ -188,7 +192,7 @@ object UpdateManager {
 
             val isBeta = tag.contains("beta", ignoreCase = true) || title.contains("beta", ignoreCase = true)
             val cleanVersion = tag.removePrefix("v").removePrefix("V").trim()
-            val downloadUrl = "https://github.com/Velocity081/droidtools/releases/download/$tag/Droidtools.apk"
+            val downloadUrl = UpstreamEndpoints.downloadUrl(tag)
 
             releases.add(
                 AppReleaseInfo(
