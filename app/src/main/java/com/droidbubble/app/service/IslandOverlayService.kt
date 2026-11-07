@@ -60,7 +60,18 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.os.Handler
 import android.os.Looper
+import com.droidbubble.app.fold.DisplayRole
+import com.droidbubble.app.fold.OverlayAction
+import com.droidbubble.app.fold.assignRoles
+import com.droidbubble.app.fold.collectDisplaySnapshots
+import com.droidbubble.app.fold.decideOverlayAction
+import com.droidbubble.app.fold.deviceReportsHinge
+import com.droidbubble.app.fold.observeRole
+import com.droidbubble.app.fold.pickSettledDisplay
+import com.droidbubble.app.fold.withActivePlacement
 import com.droidbubble.app.model.IslandSettings
+import android.hardware.display.DisplayManager
+import androidx.compose.runtime.mutableStateOf
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -117,7 +128,16 @@ class IslandOverlayService : Service() {
     private var isDroidbarExpanded: Boolean = false
 
     private val lifecycleOwner = CustomLifecycleOwner()
+    private var rawSettings = IslandSettings()
     private var currentSettings = IslandSettings()
+    private val activeRoleState = mutableStateOf(DisplayRole.SINGLE)
+    private var attachedDisplayId: Int? = null
+    private var foldingFeatureDisplayId: Int? = null
+    private var overlaySyncJob: kotlinx.coroutines.Job? = null
+    private var displayListener: DisplayManager.DisplayListener? = null
+    private var overlayDisplayContext: Context? = null
+    private var placementMigrationRequested = false
+    private var overlayCollectorsStarted = false
 
     private var cameraManager: CameraManager? = null
     private var torchCameraId: String? = null
@@ -464,13 +484,14 @@ class IslandOverlayService : Service() {
         super.onCreate()
         serviceInstance = this
         settingsRepository = SettingsRepository(this)
-        currentSettings = runBlocking(Dispatchers.IO) {
+        rawSettings = runBlocking(Dispatchers.IO) {
             try {
                 settingsRepository.settingsFlow.first()
             } catch (_: Exception) {
                 IslandSettings()
             }
         }
+        currentSettings = rawSettings.withActivePlacement(activeRoleState.value)
         IslandStateManager.dismissMediaOnPause = currentSettings.dismissMediaOnPause
         IslandStateManager.autoDismissNotifications = currentSettings.autoDismissNotifications
         IslandStateManager.autoDismissNotificationSeconds = currentSettings.notificationAutoDismissSeconds
@@ -499,7 +520,17 @@ class IslandOverlayService : Service() {
         initCameraTorch()
         startAutoUpdateChecker()
 
-        persistentTelemetryManager = PersistentWidgetTelemetryManager(this).apply { start(currentSettings) }
+        persistentTelemetryManager = PersistentWidgetTelemetryManager(this).apply {
+            onCacheWeather = { encoded ->
+                serviceScope.launch {
+                    settingsRepository.updateSettings { current ->
+                        if (current.cachedWeather == encoded) current else current.copy(cachedWeather = encoded)
+                    }
+                }
+            }
+            onCoarseLocationGranted = { runCatching { startForegroundService() } }
+            start(rawSettings)
+        }
 
         val filter = IntentFilter().apply {
             addAction("com.droidbubble.app.ACTION_SIMULATE_UNLOCK")
@@ -547,6 +578,7 @@ class IslandOverlayService : Service() {
         try {
             lastAirplaneModeState = Settings.Global.getInt(contentResolver, Settings.Global.AIRPLANE_MODE_ON, 0) != 0
         } catch (_: Exception) {}
+        registerDisplayListener()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -570,7 +602,7 @@ class IslandOverlayService : Service() {
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
-        updateWindowState(IslandStateManager.isExpanded.value)
+        scheduleOverlaySync()
     }
 
     private fun startForegroundService() {
@@ -591,15 +623,29 @@ class IslandOverlayService : Service() {
             .setVisibility(NotificationCompat.VISIBILITY_SECRET)
             .build()
 
+        val locationActive = locationWeatherActive()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
+            val types = if (locationActive) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            } else {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            )
+            }
+            startForeground(NOTIFICATION_ID, notification, types)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && locationActive) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+    }
+
+    private fun locationWeatherActive(): Boolean {
+        if (!rawSettings.showWeather || rawSettings.weatherLocationMode != com.droidbubble.app.weather.WeatherLocationMode.CURRENT) {
+            return false
+        }
+        return androidx.core.content.ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
     }
 
     private var touchManager: IslandTouchManager? = null
@@ -624,23 +670,21 @@ class IslandOverlayService : Service() {
     }
 
     @OptIn(ExperimentalMaterial3ExpressiveApi::class)
-    private fun initOverlay() {
+    private fun initOverlay(scheduleFollowUp: Boolean = true) {
         if (composeView != null) return
 
         val aService = IslandAccessibilityService.instance
-        windowManager = if (aService != null) {
-            aService.getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        } else {
-            getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        }
+        val hostContext = overlayDisplayContext ?: aService ?: this
+        windowManager = hostContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        val hostResources = hostContext.resources
 
-        val density = resources.displayMetrics.density
+        val density = hostResources.displayMetrics.density
         val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
 
-        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val isLandscape = hostResources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         val isDeviceLocked = IslandStateManager.isDeviceLocked.value
         val allowedInOrientation = currentSettings.isEnabled && (currentSettings.showInLandscape || !isLandscape) && (!currentSettings.hideOnLockScreen || !isDeviceLocked)
         val isOccupied = IslandStateManager.isOccupied && allowedInOrientation
@@ -692,14 +736,15 @@ class IslandOverlayService : Service() {
         }
         disableMoveAnimation(layoutParams!!)
 
-        val view = ComposeView(aService ?: this).apply {
+        val view = ComposeView(hostContext).apply {
             setViewTreeLifecycleOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setViewTreeViewModelStoreOwner(lifecycleOwner)
             fitsSystemWindows = false
 
             setContent {
-                val liveSettings by settingsRepository.settingsFlow.collectAsState(initial = currentSettings)
+                val liveSettings by settingsRepository.settingsFlow.collectAsState(initial = rawSettings)
+                val role = activeRoleState.value
 
                 val activeFont = remember(liveSettings.fontKey) {
                     com.droidbubble.app.theme.getIslandFontFamily(liveSettings.fontKey)
@@ -717,7 +762,7 @@ class IslandOverlayService : Service() {
                     motionScheme = MotionScheme.expressive()
                 ) {
                     IslandOverlayRoot(
-                        settings = liveSettings,
+                        settings = liveSettings.withActivePlacement(role),
                         onBoundsChange = { _, _ -> },
                         onCompactRectsChange = { rects ->
                             val interactive = IslandStateManager.isOccupied ||
@@ -744,10 +789,30 @@ class IslandOverlayService : Service() {
 
         try {
             windowManager?.addView(view, layoutParams)
+            attachedDisplayId = contextDisplayId(hostContext)
         } catch (e: Exception) {
             e.printStackTrace()
+            touchManager?.detach()
+            touchManager = null
+            composeView = null
+            attachedDisplayId = null
+            if (overlayDisplayContext != null) {
+                overlayDisplayContext = null
+                windowManager = null
+                initOverlay(scheduleFollowUp = false)
+            }
         }
 
+        if (!overlayCollectorsStarted) {
+            overlayCollectorsStarted = true
+            startOverlayCollectors()
+        }
+        if (scheduleFollowUp) {
+            scheduleOverlaySync()
+        }
+    }
+
+    private fun startOverlayCollectors() {
         // Listen for expansion and state changes to resize WindowManager touch bounds
         serviceScope.launch {
             kotlinx.coroutines.flow.combine(
@@ -797,7 +862,16 @@ class IslandOverlayService : Service() {
         // Listen for settings changes
         serviceScope.launch {
             settingsRepository.settingsFlow.collectLatest { settings ->
-                currentSettings = settings
+                rawSettings = settings
+                currentSettings = settings.withActivePlacement(activeRoleState.value)
+                if (!settings.placementProfilesInitialized && !placementMigrationRequested) {
+                    placementMigrationRequested = true
+                    serviceScope.launch {
+                        settingsRepository.updateSettings { current ->
+                            current.copy(placementProfilesInitialized = true)
+                        }
+                    }
+                }
                 persistentTelemetryManager?.updateSettings(settings)
                 IslandStateManager.dismissMediaOnPause = settings.dismissMediaOnPause
                 IslandStateManager.autoDismissNotifications = settings.autoDismissNotifications
@@ -819,6 +893,7 @@ class IslandOverlayService : Service() {
                 } else {
                     removeDroidbar()
                 }
+                runCatching { startForegroundService() }
             }
         }
     }
@@ -860,9 +935,10 @@ class IslandOverlayService : Service() {
         touchManager?.isExpanded = expanded
         val view = composeView ?: return
         val params = layoutParams ?: return
-        val density = resources.displayMetrics.density
+        val overlayResources = (overlayDisplayContext ?: this).resources
+        val density = overlayResources.displayMetrics.density
 
-        val isLandscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        val isLandscape = overlayResources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
         val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
         if (km != null) {
             IslandStateManager.setDeviceLocked(km.isKeyguardLocked)
@@ -1028,6 +1104,110 @@ class IslandOverlayService : Service() {
             }
         }
         composeView = null
+        attachedDisplayId = null
+    }
+
+    private fun contextDisplayId(context: Context): Int? {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            context.display?.displayId
+        } else {
+            @Suppress("DEPRECATION")
+            (context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager)?.defaultDisplay?.displayId
+        }
+    }
+
+    private fun registerDisplayListener() {
+        val manager = getSystemService(DisplayManager::class.java) ?: return
+        val listener = object : DisplayManager.DisplayListener {
+            override fun onDisplayAdded(displayId: Int) = scheduleOverlaySync()
+            override fun onDisplayRemoved(displayId: Int) = scheduleOverlaySync()
+            override fun onDisplayChanged(displayId: Int) = scheduleOverlaySync()
+        }
+        displayListener = listener
+        manager.registerDisplayListener(listener, Handler(Looper.getMainLooper()))
+    }
+
+    private fun scheduleOverlaySync() {
+        overlaySyncJob?.cancel()
+        overlaySyncJob = serviceScope.launch {
+            kotlinx.coroutines.delay(200)
+            syncOverlayToActiveDisplay()
+        }
+    }
+
+    private fun syncOverlayToActiveDisplay() {
+        val snapshots = collectDisplaySnapshots(this, foldingFeatureDisplayId)
+        val roles = assignRoles(
+            deviceReportsHinge = deviceReportsHinge(this),
+            seenFoldingFeature = rawSettings.seenFoldingFeature,
+            displays = snapshots
+        )
+        val active = pickSettledDisplay(snapshots.filter { it.stateOn })
+        val action = decideOverlayAction(
+            hasView = composeView != null,
+            attachedDisplayId = attachedDisplayId,
+            activeDisplayId = active?.displayId
+        )
+        when (action) {
+            OverlayAction.KEEP -> Unit
+            OverlayAction.HIDE -> {
+                if (composeView != null) {
+                    val view = composeView ?: return
+                    val params = layoutParams ?: return
+                    applyLayoutParams(
+                        view = view,
+                        params = params,
+                        width = 1,
+                        height = 1,
+                        x = 0,
+                        y = 0,
+                        gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL,
+                        flags = params.flags or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    )
+                }
+            }
+            OverlayAction.UPDATE_IN_PLACE -> {
+                val display = active ?: return
+                applyActiveRole(roles[display.displayId] ?: DisplayRole.SINGLE, display.hasFoldingFeature, display.displayId)
+                updateWindowState(IslandStateManager.isExpanded.value)
+            }
+            OverlayAction.REBIND -> {
+                val display = active ?: return
+                val manager = getSystemService(DisplayManager::class.java) ?: return
+                val target = manager.getDisplay(display.displayId) ?: return
+                applyActiveRole(roles[display.displayId] ?: DisplayRole.SINGLE, display.hasFoldingFeature, display.displayId)
+                removeDroidbar()
+                removeOverlay()
+                overlayDisplayContext = runCatching { createDisplayContext(target) }.getOrNull()
+                if (composeView != null) return
+                initOverlay(scheduleFollowUp = false)
+                if (composeView != null && overlayDisplayContext != null) {
+                    attachedDisplayId = display.displayId
+                }
+                if (rawSettings.droidbarEnabled && com.droidbubble.app.ui.main.PermissionHelper.isOverlayGranted(this)) {
+                    initDroidbar()
+                }
+            }
+        }
+    }
+
+    private fun applyActiveRole(role: DisplayRole, hasFoldingFeature: Boolean, displayId: Int) {
+        activeRoleState.value = role
+        if (hasFoldingFeature) {
+            foldingFeatureDisplayId = displayId
+        }
+        currentSettings = rawSettings.withActivePlacement(role)
+        val shouldPersistFold = hasFoldingFeature && !rawSettings.seenFoldingFeature
+        val shouldPersistRole = role != DisplayRole.SINGLE && role !in rawSettings.placementRolesSeen
+        val shouldPersistActive = role != rawSettings.lastActiveRole
+        if (!shouldPersistFold && !shouldPersistRole && !shouldPersistActive) return
+        serviceScope.launch {
+            settingsRepository.updateSettings { settings ->
+                val observed = settings.observeRole(role)
+                val withFold = if (hasFoldingFeature) observed.copy(seenFoldingFeature = true) else observed
+                withFold.withActivePlacement(role)
+            }
+        }
     }
 
         @OptIn(ExperimentalMaterial3ExpressiveApi::class)
@@ -1036,7 +1216,7 @@ class IslandOverlayService : Service() {
         val wm = windowManager ?: (getSystemService(Context.WINDOW_SERVICE) as? WindowManager) ?: return
         windowManager = wm
 
-        val density = resources.displayMetrics.density
+        val density = (overlayDisplayContext ?: this).resources.displayMetrics.density
         val realScreenHeight = getRealScreenHeight(wm)
         val initialWidth = (32 * density).toInt()
         val initialHeight = (72 * density).toInt()
@@ -1122,7 +1302,7 @@ class IslandOverlayService : Service() {
         val params = droidbarParams ?: return
         val v = droidbarView ?: return
         val wm = windowManager ?: return
-        val density = resources.displayMetrics.density
+        val density = (overlayDisplayContext ?: this).resources.displayMetrics.density
         val realScreenHeight = getRealScreenHeight(wm)
 
         if (isExpanded) {
@@ -1165,6 +1345,11 @@ class IslandOverlayService : Service() {
     }
 
 override fun onDestroy() {
+        overlaySyncJob?.cancel()
+        displayListener?.let { listener ->
+            runCatching { getSystemService(DisplayManager::class.java)?.unregisterDisplayListener(listener) }
+        }
+        displayListener = null
         removeDroidbar()
         super.onDestroy()
         if (serviceInstance === this) {
@@ -1187,6 +1372,9 @@ override fun onDestroy() {
 
 
     private fun startAutoUpdateChecker() {
+        if (!com.droidbubble.app.util.UpdatePolicy.shouldCheckUpstream(com.droidbubble.app.BuildConfig.UPSTREAM_UPDATE_CHECKS)) {
+            return
+        }
         serviceScope.launch(Dispatchers.IO) {
             delay(15_000L)
             while (isActive) {

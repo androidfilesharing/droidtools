@@ -226,7 +226,20 @@ import androidx.compose.ui.unit.sp
 import androidx.core.graphics.drawable.toBitmap
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import com.droidbubble.app.fold.BubblePlacement
+import com.droidbubble.app.fold.CutoutRect
+import com.droidbubble.app.fold.DisplayRole
+import com.droidbubble.app.fold.observeRole
+import com.droidbubble.app.fold.placementFromCutout
+import com.droidbubble.app.fold.rememberActiveDisplayRole
+import com.droidbubble.app.fold.withPlacementEdit
 import com.droidbubble.app.model.IslandSettings
+import com.droidbubble.app.weather.WeatherLocationMode
+import com.droidbubble.app.weather.WeatherUnits
+import com.droidbubble.app.weather.decodeSnapshot
+import com.droidbubble.app.weather.weatherStatusLine
+import androidx.compose.ui.res.stringResource
+import com.droidbubble.app.R
 import com.droidbubble.app.service.IslandOverlayService
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -586,7 +599,7 @@ fun MainScreen(
                                 verticalArrangement = Arrangement.Center
                             ) {
                                 Text(
-                                    text = "Droidtools",
+                                    text = stringResource(R.string.app_name),
                                     fontWeight = FontWeight.Bold,
                                     fontSize = titleSize,
                                     color = MaterialTheme.colorScheme.onBackground,
@@ -625,6 +638,16 @@ fun MainScreen(
                         contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 32.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
+                        item {
+                            val warning = stringResource(R.string.side_by_side_warning)
+                            if (warning.isNotBlank()) {
+                                Text(
+                                    text = warning,
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                            }
+                        }
                         item {
                             UpdateCardItem(
                                 updateState = updateState,
@@ -2028,6 +2051,21 @@ fun DimensionsPage(
             )
         }
     ) { innerPadding ->
+        val context = LocalContext.current
+        val role = rememberActiveDisplayRole(settings.seenFoldingFeature) {
+            onUpdateSettings { current ->
+                if (current.seenFoldingFeature) current else current.copy(seenFoldingFeature = true)
+            }
+        }
+        val activePlacement = when (role) {
+            DisplayRole.INNER -> settings.innerPlacement
+            else -> settings.coverPlacement
+        }
+        fun writePlacement(next: BubblePlacement) {
+            onUpdateSettings { current ->
+                current.observeRole(role).withPlacementEdit(role, next)
+            }
+        }
         LazyColumn(
             modifier = Modifier
                 .fillMaxSize()
@@ -2036,21 +2074,60 @@ fun DimensionsPage(
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             item {
+                val label = when (role) {
+                    DisplayRole.COVER -> "Editing cover display"
+                    DisplayRole.INNER -> "Editing inner display"
+                    DisplayRole.SINGLE -> null
+                }
+                if (label != null) {
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            item {
+                val cutout = (context as? android.app.Activity)?.window?.decorView?.rootWindowInsets?.displayCutout
+                val rects = cutout?.boundingRects.orEmpty().map { CutoutRect(it.left, it.top, it.right, it.bottom) }
+                val aligned = placementFromCutout(
+                    rects = rects,
+                    screenWidthPx = context.resources.displayMetrics.widthPixels,
+                    pillHeightDp = settings.heightDp,
+                    density = context.resources.displayMetrics.density,
+                    current = activePlacement
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    TextButton(
+                        onClick = { if (aligned != null) writePlacement(aligned) },
+                        enabled = aligned != null
+                    ) {
+                        Text("Align to this display's cutout")
+                    }
+                    if (aligned == null) {
+                        Text(
+                            text = "No cutout reported",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            item {
                 val currentCutoutMode = when {
-                    settings.isTeardropCutout -> CutoutModeOption.TEARDROP
-                    settings.isLeftCutout -> CutoutModeOption.LEFT
+                    activePlacement.isTeardropCutout -> CutoutModeOption.TEARDROP
+                    activePlacement.isLeftCutout -> CutoutModeOption.LEFT
                     else -> CutoutModeOption.CENTER
                 }
                 CutoutPositionSelectorCard(
                     selectedMode = currentCutoutMode,
                     onSelectMode = { mode ->
-                        onUpdateSettings { s ->
-                            when (mode) {
-                                CutoutModeOption.CENTER -> s.copy(isLeftCutout = false, isTeardropCutout = false)
-                                CutoutModeOption.LEFT -> s.copy(isLeftCutout = true, isTeardropCutout = false)
-                                CutoutModeOption.TEARDROP -> s.copy(isLeftCutout = false, isTeardropCutout = true)
-                            }
+                        val next = when (mode) {
+                            CutoutModeOption.CENTER -> activePlacement.copy(isLeftCutout = false, isTeardropCutout = false)
+                            CutoutModeOption.LEFT -> activePlacement.copy(isLeftCutout = true, isTeardropCutout = false)
+                            CutoutModeOption.TEARDROP -> activePlacement.copy(isLeftCutout = false, isTeardropCutout = true)
                         }
+                        writePlacement(next)
                     }
                 )
             }
@@ -2093,20 +2170,20 @@ fun DimensionsPage(
                     SettingsCardItem(position = GroupPosition.MIDDLE) {
                         SliderSettingItem(
                             label = "Top Offset (Notch Line-up)",
-                            value = settings.topOffsetDp.toFloat(),
+                            value = activePlacement.topOffsetDp.toFloat(),
                             unit = "dp",
-                            valueRange = 0f..60f,
-                            onValueChange = { onUpdateSettings { s -> s.copy(topOffsetDp = it.roundToInt()) } }
+                            valueRange = 0f..120f,
+                            onValueChange = { writePlacement(activePlacement.copy(topOffsetDp = it.roundToInt())) }
                         )
                     }
 
                     SettingsCardItem(position = GroupPosition.MIDDLE) {
                         SliderSettingItem(
                             label = "Horizontal Offset",
-                            value = settings.horizontalOffsetDp.toFloat(),
+                            value = activePlacement.horizontalOffsetDp.toFloat(),
                             unit = "dp",
-                            valueRange = -50f..50f,
-                            onValueChange = { onUpdateSettings { s -> s.copy(horizontalOffsetDp = it.roundToInt()) } }
+                            valueRange = -120f..120f,
+                            onValueChange = { writePlacement(activePlacement.copy(horizontalOffsetDp = it.roundToInt())) }
                         )
                     }
 
@@ -2779,6 +2856,21 @@ fun GeneralPage(
     BackHandler(onBack = onBack)
     var showWeatherDialog by remember { mutableStateOf(false) }
     var weatherCityInput by remember(settings.weatherCity) { mutableStateOf(settings.weatherCity) }
+    var draftUnits by remember(settings.weatherUnits) { mutableStateOf(settings.weatherUnits) }
+    var draftMode by remember(settings.weatherLocationMode) { mutableStateOf(settings.weatherLocationMode) }
+    val weatherContext = LocalContext.current
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        draftMode = if (granted) WeatherLocationMode.CURRENT else WeatherLocationMode.MANUAL
+        onUpdateSettings { current ->
+            if (granted) {
+                current.copy(weatherLocationMode = WeatherLocationMode.CURRENT, weatherLocationDenied = false)
+            } else {
+                current.copy(weatherLocationMode = WeatherLocationMode.MANUAL, weatherLocationDenied = true)
+            }
+        }
+    }
 
     if (showWeatherDialog) {
         AlertDialog(
@@ -2787,8 +2879,12 @@ fun GeneralPage(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "Enter a city or location name to show weather for (e.g. London, Paris, New York, Thessaloniki). Leave blank for automatic time-zone approximation.",
+                        "Approximate location is sent to Open-Meteo when weather refreshes. Droidtools does not keep a location history. A city name still works if you decline.",
                         style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        "Leave the city blank for a time-zone estimate, which is not your location.",
+                        style = MaterialTheme.typography.bodySmall
                     )
                     OutlinedTextField(
                         value = weatherCityInput,
@@ -2797,12 +2893,47 @@ fun GeneralPage(
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth()
                     )
+                    Text("Units", fontWeight = FontWeight.SemiBold)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        WeatherUnits.entries.forEach { units ->
+                            TextButton(onClick = { draftUnits = units }) {
+                                Text(if (draftUnits == units) "● ${units.name.lowercase().replaceFirstChar { it.uppercase() }}" else units.name.lowercase().replaceFirstChar { it.uppercase() })
+                            }
+                        }
+                    }
+                    Text("Location", fontWeight = FontWeight.SemiBold)
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(onClick = { draftMode = WeatherLocationMode.MANUAL }) {
+                            Text(if (draftMode == WeatherLocationMode.MANUAL) "● City" else "City")
+                        }
+                        TextButton(onClick = { draftMode = WeatherLocationMode.CURRENT }) {
+                            Text(if (draftMode == WeatherLocationMode.CURRENT) "● Current location" else "Current location")
+                        }
+                    }
                 }
             },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        onUpdateSettings { it.copy(weatherCity = weatherCityInput.trim()) }
+                        onUpdateSettings { current ->
+                            current.copy(
+                                weatherCity = weatherCityInput.trim(),
+                                weatherUnits = draftUnits,
+                                weatherLocationMode = if (draftMode == WeatherLocationMode.CURRENT) current.weatherLocationMode else WeatherLocationMode.MANUAL,
+                                weatherLocationDenied = if (draftMode == WeatherLocationMode.MANUAL) false else current.weatherLocationDenied
+                            )
+                        }
+                        if (draftMode == WeatherLocationMode.CURRENT) {
+                            val granted = androidx.core.content.ContextCompat.checkSelfPermission(
+                                weatherContext,
+                                android.Manifest.permission.ACCESS_COARSE_LOCATION
+                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                            if (granted) {
+                                onUpdateSettings { it.copy(weatherLocationMode = WeatherLocationMode.CURRENT, weatherLocationDenied = false) }
+                            } else {
+                                locationPermissionLauncher.launch(android.Manifest.permission.ACCESS_COARSE_LOCATION)
+                            }
+                        }
                         showWeatherDialog = false
                     }
                 ) {
@@ -3025,12 +3156,26 @@ fun GeneralPage(
                             colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                             modifier = Modifier.clickable {
                                 weatherCityInput = settings.weatherCity
+                                draftUnits = settings.weatherUnits
+                                draftMode = settings.weatherLocationMode
                                 showWeatherDialog = true
                             },
                             headlineContent = {
                                 Text(
                                     if (settings.weatherCity.isBlank()) "Weather Location" else "Weather Location (${settings.weatherCity})",
                                     fontWeight = FontWeight.SemiBold
+                                )
+                            },
+                            supportingContent = {
+                                Text(
+                                    weatherStatusLine(
+                                        mode = settings.weatherLocationMode,
+                                        units = settings.weatherUnits,
+                                        region = Locale.getDefault().country,
+                                        snapshot = decodeSnapshot(settings.cachedWeather),
+                                        denied = settings.weatherLocationDenied,
+                                        nowMs = System.currentTimeMillis()
+                                    )
                                 )
                             },
                             leadingContent = {

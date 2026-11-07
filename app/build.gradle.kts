@@ -36,8 +36,23 @@ android {
     buildFeatures {
       compose = true
       aidl = false
-      buildConfig = false
+      buildConfig = true
       shaders = false
+    }
+
+    flavorDimensions += "distribution"
+    productFlavors {
+        create("prod") {
+            dimension = "distribution"
+            isDefault = true
+            buildConfigField("boolean", "UPSTREAM_UPDATE_CHECKS", "true")
+        }
+        create("sidetest") {
+            dimension = "distribution"
+            applicationIdSuffix = ".test"
+            versionNameSuffix = "-test"
+            buildConfigField("boolean", "UPSTREAM_UPDATE_CHECKS", "false")
+        }
     }
 
     testOptions {
@@ -75,6 +90,7 @@ dependencies {
   implementation(libs.androidx.compose.material3)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.datastore.preferences)
+  implementation(libs.androidx.window)
   // Tooling
   debugImplementation(libs.androidx.compose.ui.tooling)
   // Instrumented tests

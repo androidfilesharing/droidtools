@@ -1,5 +1,6 @@
 package com.droidbubble.app.weather
 
+import com.droidbubble.app.model.WeatherInfo
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.net.URLEncoder
@@ -268,6 +269,26 @@ fun decodeSnapshot(raw: String): WeatherSnapshot? {
             hasReading = parts[12].toBoolean()
         )
     }.getOrNull()
+}
+
+fun WeatherSnapshot.toWeatherInfo(unit: TempUnit): WeatherInfo {
+    return WeatherInfo(
+        temperatureC = temperatureC,
+        condition = condition,
+        highC = highC,
+        lowC = lowC,
+        humidityPct = humidityPct,
+        windKmh = windKmh,
+        uvIndex = 0,
+        cityName = placeLabel,
+        hourlyForecast = emptyList(),
+        hasReading = hasReading,
+        temperatureLabel = if (hasReading) formatTemperature(temperatureC, unit) else "—",
+        statusName = status.name,
+        sourceName = source.name,
+        detail = detail,
+        fetchedAtEpochMs = fetchedAtEpochMs
+    )
 }
 
 fun weatherCondition(code: Int): String {
